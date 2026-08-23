@@ -172,6 +172,7 @@ func _on_server_url_changed(text):
 
 func _on_email_changed(text):
 	_user_email = text.strip_edges()
+	print("[GRTC] Email changed: '", _user_email, "'")
 	_save_state()
 
 func _on_session_changed(text):
@@ -195,16 +196,23 @@ func _on_repo_url_changed(text):
 	_save_state()
 
 func _on_login_pressed():
+	print("[GRTC] Login button pressed, email: '", _user_email, "'")
 	if _user_email == "":
 		_set_status("Your Email is required before login.", true)
 		return
 	_login_state = _generate_login_state()
-	OS.shell_open(_server_url + "/github/login?state=" + _encode_query(_login_state))
-	_auth_request_mode = "login"
-	_auth_polling = true
-	_auth_poll_started_at = OS.get_ticks_msec()
-	_auth_last_poll_at = 0
-	_set_status("Opened GitHub login in your browser.")
+	var url = _server_url + "/github/login?state=" + _encode_query(_login_state)
+	print("[GRTC] Opening URL: ", url)
+	var err = OS.shell_open(url)
+	if err != OK:
+		_set_status("Failed to open browser: " + str(err), true)
+		print("[GRTC] shell_open error: ", err)
+	else:
+		_auth_request_mode = "login"
+		_auth_polling = true
+		_auth_poll_started_at = OS.get_ticks_msec()
+		_auth_last_poll_at = 0
+		_set_status("Opened GitHub login in your browser.")
 
 func _poll_latest_auth():
 	if _auth_http == null or _login_state == "":
