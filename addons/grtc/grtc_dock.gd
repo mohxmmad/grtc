@@ -11,10 +11,12 @@ var _editor_interface = null
 var _busy = false
 var _auth_polling = false
 var _auth_request_in_flight = false
+var _auth_request_mode = ""
 var _auth_poll_started_at = 0
 var _auth_last_poll_at = 0
 var _auth_poll_interval_ms = 1500
 var _auth_timeout_ms = 120000
+var _login_state = ""
 
 var _server_url = SERVER_DEFAULT
 var _user_email = ""
@@ -33,7 +35,6 @@ var _user_id_edit = null
 var _username_edit = null
 var _project_path_edit = null
 var _repo_url_edit = null
-var _github_token_edit = null
 
 func set_editor_interface(editor_interface):
 	_editor_interface = editor_interface
@@ -45,6 +46,7 @@ func _ready():
 	_build_ui()
 	_load_state()
 	_refresh_fields()
+	_restore_saved_session()
 	_set_status("Ready")
 	set_process(true)
 
@@ -63,6 +65,18 @@ func _process(delta):
 	if now - _auth_last_poll_at < _auth_poll_interval_ms:
 		return
 	_poll_latest_auth()
+
+func _restore_saved_session():
+	if _session_id == "":
+		return
+	_auth_request_mode = "session"
+	var headers = PoolStringArray(["X-Session-ID: %s" % _session_id])
+	_auth_request_in_flight = true
+	_auth_last_poll_at = OS.get_ticks_msec()
+	var err = _auth_http.request(_server_url + "/github/session-auth", headers)
+	if err != OK:
+		_auth_request_in_flight = false
+		_set_status("Failed to restore saved session (%s)." % str(err), true)
 
 func _build_ui():
 	var title = Label.new()
@@ -93,8 +107,6 @@ func _build_ui():
 	_project_path_edit = get_child(get_child_count() - 1).get_child(1)
 	parent_add(_row_line_edit("Repository URL", true, _current_repo_url, self, "_on_repo_url_changed"), self)
 	_repo_url_edit = get_child(get_child_count() - 1).get_child(1)
-	parent_add(_row_line_edit("GitHub Token", true, _github_token, self, "_on_github_token_changed"), self)
-	_github_token_edit = get_child(get_child_count() - 1).get_child(1)
 
 	var actions = HBoxContainer.new()
 	add_child(actions)
@@ -139,7 +151,6 @@ func _refresh_fields():
 	_set_line_edit(_username_edit, _github_username)
 	_set_line_edit(_project_path_edit, _project_path)
 	_set_line_edit(_repo_url_edit, _current_repo_url)
-	_set_line_edit(_github_token_edit, _github_token)
 
 func _set_line_edit(node, value):
 	if node and node.text != value:
@@ -183,26 +194,24 @@ func _on_repo_url_changed(text):
 	_current_repo_url = text.strip_edges()
 	_save_state()
 
-func _on_github_token_changed(text):
-	_github_token = text.strip_edges()
-	_save_state()
-
 func _on_login_pressed():
 	if _user_email == "":
 		_set_status("Your Email is required before login.", true)
 		return
-	OS.shell_open(_server_url + "/github/login")
+	_login_state = _generate_login_state()
+	OS.shell_open(_server_url + "/github/login?state=" + _encode_query(_login_state))
+	_auth_request_mode = "login"
 	_auth_polling = true
 	_auth_poll_started_at = OS.get_ticks_msec()
 	_auth_last_poll_at = 0
 	_set_status("Opened GitHub login in your browser.")
 
 func _poll_latest_auth():
-	if _auth_http == null or _user_email == "":
+	if _auth_http == null or _login_state == "":
 		return
 	_auth_request_in_flight = true
 	_auth_last_poll_at = OS.get_ticks_msec()
-	var url = _server_url + "/github/latest-auth?email=" + _encode_query(_user_email)
+	var url = _server_url + "/github/latest-auth?state=" + _encode_query(_login_state)
 	var err = _auth_http.request(url)
 	if err != OK:
 		_auth_request_in_flight = false
@@ -230,9 +239,10 @@ func _on_auth_request_completed(result, response_code, headers, body):
 	_github_token = str(data.get("github_token", _github_token))
 	_current_repo_url = _resolve_repo_url()
 	_auth_polling = false
+	_login_state = ""
 	_refresh_fields()
 	_save_state()
-	_set_status("Login synced. Session and GitHub token saved.")
+	_set_status("Login synced. Session restored and token loaded in memory.")
 
 func _on_push_pressed():
 	if _busy:
@@ -244,7 +254,7 @@ func _on_push_pressed():
 	if _current_repo_url == "":
 		_current_repo_url = _resolve_repo_url()
 	if _current_repo_url == "" or _github_token == "":
-		_set_status("Repository URL and GitHub token are required before pushing.", true)
+		_set_status("Repository URL or GitHub session is missing. Login again if needed.", true)
 		return
 	_busy = true
 	var author_name = _github_username if _github_username != "" else _fallback_username()
@@ -266,7 +276,7 @@ func _on_pull_pressed():
 	if _current_repo_url == "":
 		_current_repo_url = _resolve_repo_url()
 	if _current_repo_url == "" or _github_token == "":
-		_set_status("Repository URL and GitHub token are required before pulling.", true)
+		_set_status("Repository URL or GitHub session is missing. Login again if needed.", true)
 		return
 	_busy = true
 	var author_name = _github_username if _github_username != "" else _fallback_username()
@@ -321,6 +331,11 @@ func _encode_query(value):
 			out += "%%%02X" % c
 	return out
 
+func _generate_login_state():
+	var rng = RandomNumberGenerator.new()
+	rng.randomize()
+	return str(OS.get_unix_time()) + "_" + str(rng.randi())
+
 func _fallback_username():
 	if _user_email.find("@") != -1:
 		return _user_email.split("@")[0]
@@ -340,7 +355,6 @@ func _save_state():
 	cfg.set_value("grtc", "github_username", _github_username)
 	cfg.set_value("grtc", "project_path", _project_path)
 	cfg.set_value("grtc", "current_repo_url", _current_repo_url)
-	cfg.set_value("grtc", "github_token", _github_token)
 	cfg.save("user://grtc_panel.cfg")
 
 func _load_state():
@@ -355,4 +369,4 @@ func _load_state():
 	_github_username = str(cfg.get_value("grtc", "github_username", ""))
 	_project_path = str(cfg.get_value("grtc", "project_path", ProjectSettings.globalize_path("res://")))
 	_current_repo_url = str(cfg.get_value("grtc", "current_repo_url", ""))
-	_github_token = str(cfg.get_value("grtc", "github_token", ""))
+	_github_token = ""
