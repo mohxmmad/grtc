@@ -7,7 +7,7 @@
 [node name="GRTC" type="Spatial"]
 
 [node name="Cube" type="MeshInstance" parent="."]
-transform = Transform( 1, 0, 0, 0, 1, 0, 0, 0, 1, -2.04097, 0, 0 )
+transform = Transform( 1, 0, 0, 0, 1, 0, 0, 0, 1, -1.69948, 0, 0 )
 mesh = SubResource( 1 )
 
 [node name="Camera" type="Camera" parent="."]
