@@ -34,6 +34,12 @@ func ensure_remote(project_path, remote_name, remote_url):
 		return _run_git(project_path, ["remote", "set-url", remote_name, remote_url])
 	return _run_git(project_path, ["remote", "add", remote_name, remote_url])
 
+func get_remote_url(project_path, remote_name):
+	var result = _run_git(project_path, ["remote", "get-url", remote_name])
+	if result.code != 0 or result.output.size() == 0:
+		return ""
+	return str(result.output[0]).strip_edges()
+
 func checkout_main(project_path):
 	return _run_git(project_path, ["checkout", "-B", "main"])
 
@@ -52,6 +58,11 @@ func pull(project_path, remote_name, branch_name, username, token):
 	return _run_git(project_path, ["pull", auth_remote, branch_name])
 
 func execute_full_workflow(project_path, repo_url, author_name, author_email, token, commit_message):
+	if repo_url == "":
+		repo_url = get_remote_url(project_path, "origin")
+	if repo_url == "":
+		return {"code": 1, "output": ["origin remote not found"]}
+
 	var init_result = init_repository(project_path)
 	if init_result.get("code", 0) != 0:
 		return init_result

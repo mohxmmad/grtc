@@ -4,10 +4,17 @@ extends VBoxContainer
 const SERVER_DEFAULT = "http://localhost:8000"
 
 var _http = null
+var _auth_http = null
 var _git = preload("res://addons/grtc/grtc_git_helper.gd").new()
 var _editor_interface = null
 
 var _busy = false
+var _auth_polling = false
+var _auth_request_in_flight = false
+var _auth_poll_started_at = 0
+var _auth_last_poll_at = 0
+var _auth_poll_interval_ms = 1500
+var _auth_timeout_ms = 120000
 
 var _server_url = SERVER_DEFAULT
 var _user_email = ""
@@ -32,13 +39,30 @@ func set_editor_interface(editor_interface):
 	_editor_interface = editor_interface
 
 func _ready():
+	_auth_http = HTTPRequest.new()
+	add_child(_auth_http)
+	_auth_http.connect("request_completed", self, "_on_auth_request_completed")
 	_build_ui()
 	_load_state()
 	_refresh_fields()
 	_set_status("Ready")
+	set_process(true)
 
 func _exit_tree():
+	_auth_polling = false
 	_save_state()
+
+func _process(delta):
+	if not _auth_polling or _auth_request_in_flight:
+		return
+	var now = OS.get_ticks_msec()
+	if now - _auth_poll_started_at > _auth_timeout_ms:
+		_auth_polling = false
+		_set_status("Login timed out. Open GitHub login again.", true)
+		return
+	if now - _auth_last_poll_at < _auth_poll_interval_ms:
+		return
+	_poll_latest_auth()
 
 func _build_ui():
 	var title = Label.new()
@@ -164,8 +188,51 @@ func _on_github_token_changed(text):
 	_save_state()
 
 func _on_login_pressed():
+	if _user_email == "":
+		_set_status("Your Email is required before login.", true)
+		return
 	OS.shell_open(_server_url + "/github/login")
+	_auth_polling = true
+	_auth_poll_started_at = OS.get_ticks_msec()
+	_auth_last_poll_at = 0
 	_set_status("Opened GitHub login in your browser.")
+
+func _poll_latest_auth():
+	if _auth_http == null or _user_email == "":
+		return
+	_auth_request_in_flight = true
+	_auth_last_poll_at = OS.get_ticks_msec()
+	var url = _server_url + "/github/latest-auth?email=" + _encode_query(_user_email)
+	var err = _auth_http.request(url)
+	if err != OK:
+		_auth_request_in_flight = false
+		_set_status("Failed to poll login state (%s)." % str(err), true)
+
+func _on_auth_request_completed(result, response_code, headers, body):
+	_auth_request_in_flight = false
+	if result != HTTPRequest.RESULT_SUCCESS:
+		return
+	if response_code != 200:
+		return
+
+	var parsed = JSON.parse(body.get_string_from_utf8())
+	if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY:
+		return
+
+	var data = parsed.result
+	if not data.get("success", false):
+		return
+
+	_session_id = str(data.get("session_id", _session_id))
+	_user_id = str(data.get("user", {}).get("id", _user_id))
+	_github_username = str(data.get("user", {}).get("username", _github_username))
+	_user_email = str(data.get("user", {}).get("email", _user_email))
+	_github_token = str(data.get("github_token", _github_token))
+	_current_repo_url = _resolve_repo_url()
+	_auth_polling = false
+	_refresh_fields()
+	_save_state()
+	_set_status("Login synced. Session and GitHub token saved.")
 
 func _on_push_pressed():
 	if _busy:
@@ -174,6 +241,8 @@ func _on_push_pressed():
 	if project_path == "":
 		_set_status("Project path is required.", true)
 		return
+	if _current_repo_url == "":
+		_current_repo_url = _resolve_repo_url()
 	if _current_repo_url == "" or _github_token == "":
 		_set_status("Repository URL and GitHub token are required before pushing.", true)
 		return
@@ -194,6 +263,8 @@ func _on_pull_pressed():
 	if project_path == "":
 		_set_status("Project path is required.", true)
 		return
+	if _current_repo_url == "":
+		_current_repo_url = _resolve_repo_url()
 	if _current_repo_url == "" or _github_token == "":
 		_set_status("Repository URL and GitHub token are required before pulling.", true)
 		return
@@ -214,6 +285,8 @@ func _on_pull_pressed():
 		_set_status(_join_lines(result.get("output", ["Git pull failed"])) , true)
 
 func _refresh_project_files():
+	_current_repo_url = _resolve_repo_url()
+	_refresh_fields()
 	if _editor_interface:
 		_editor_interface.get_resource_filesystem().scan()
 	_set_status("Project files refreshed.")
@@ -228,6 +301,25 @@ func _project_root():
 	if _project_path != "":
 		return _project_path
 	return ProjectSettings.globalize_path("res://")
+
+func _resolve_repo_url():
+	var project_path = _project_root()
+	if project_path == "":
+		return _current_repo_url
+	var remote_url = _git.get_remote_url(project_path, "origin")
+	if remote_url != "":
+		return remote_url
+	return _current_repo_url
+
+func _encode_query(value):
+	var out = ""
+	for i in range(value.length()):
+		var c = value[i]
+		if (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 45 or c == 95 or c == 46 or c == 126:
+			out += char(c)
+		else:
+			out += "%%%02X" % c
+	return out
 
 func _fallback_username():
 	if _user_email.find("@") != -1:
