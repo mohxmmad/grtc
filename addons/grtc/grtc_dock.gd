@@ -220,16 +220,30 @@ func _poll_latest_auth():
 func _on_auth_request_completed(result, response_code, headers, body):
 	_auth_request_in_flight = false
 	if result != HTTPRequest.RESULT_SUCCESS:
+		_set_status("Login poll failed (network error).", true)
+		_auth_polling = false
 		return
+
+	if response_code == 404:
+		# Login not completed yet, keep polling
+		_set_status("Waiting for GitHub login to complete...")
+		return
+
 	if response_code != 200:
+		_set_status("Login poll error: HTTP %d" % response_code, true)
+		_auth_polling = false
 		return
 
 	var parsed = JSON.parse(body.get_string_from_utf8())
 	if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY:
+		_set_status("Invalid response from server.", true)
+		_auth_polling = false
 		return
 
 	var data = parsed.result
 	if not data.get("success", false):
+		_set_status("Login failed: %s" % str(data.get("message", "Unknown error")), true)
+		_auth_polling = false
 		return
 
 	_session_id = str(data.get("session_id", _session_id))

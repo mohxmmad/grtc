@@ -4,7 +4,7 @@
 
 [sub_resource type="SphereMesh" id=2]
 
-[node name="RTC_Test" type="Spatial"]
+[node name="GRTC" type="Spatial"]
 
 [node name="Cube" type="MeshInstance" parent="."]
 transform = Transform( 1, 0, 0, 0, 1, 0, 0, 0, 1, -2.04097, 0, 0 )

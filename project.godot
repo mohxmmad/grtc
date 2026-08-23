@@ -10,8 +10,8 @@ config_version=4
 
 [application]
 
-config/name="RTC Test"
-run/main_scene="res://RTC_Test.tscn"
+config/name="GRTC"
+run/main_scene="res://GRTC.tscn"
 config/icon="res://icon.png"
 
 [editor_plugins]
