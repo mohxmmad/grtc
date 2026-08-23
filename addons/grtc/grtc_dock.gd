@@ -347,10 +347,11 @@ func _encode_query(value):
 	var out = ""
 	for i in range(value.length()):
 		var c = value[i]
-		if (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 45 or c == 95 or c == 46 or c == 126:
-			out += char(c)
+		var ord_c = ord(c)
+		if (ord_c >= 48 and ord_c <= 57) or (ord_c >= 65 and ord_c <= 90) or (ord_c >= 97 and ord_c <= 122) or ord_c == 45 or ord_c == 95 or ord_c == 46 or ord_c == 126:
+			out += char(ord_c)
 		else:
-			out += "%%%02X" % c
+			out += "%%%02X" % ord_c
 	return out
 
 func _generate_login_state():
