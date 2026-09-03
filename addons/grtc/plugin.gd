@@ -2,22 +2,17 @@ tool
 extends EditorPlugin
 
 var dock = null
-var window = null
 var button = null
+var dock_slot = DOCK_SLOT_RIGHT_UL
 
 func _enter_tree():
 	dock = preload("res://addons/grtc/grtc_dock.gd").new()
 	dock.set_editor_interface(get_editor_interface())
-
-	window = WindowDialog.new()
-	window.name = "GRTC"
-	window.rect_min_size = Vector2(700, 520)
-	window.window_title = "GRTC"
-	window.add_child(dock)
-	get_editor_interface().get_base_control().add_child(window)
+	dock.name = "GRTC"
+	add_control_to_dock(dock_slot, dock)
 
 	button = ToolButton.new()
-	button.text = "GRTC"
+	button.text = "GRTC Sync"
 	button.connect("pressed", self, "_toggle_window")
 	add_control_to_container(CONTAINER_TOOLBAR, button)
 
@@ -26,15 +21,15 @@ func _exit_tree():
 		remove_control_from_container(CONTAINER_TOOLBAR, button)
 		button.queue_free()
 		button = null
-	if window:
-		window.queue_free()
-		window = null
+	if dock:
+		remove_control_from_docks(dock)
+		dock.queue_free()
 	dock = null
 
 func _toggle_window():
-	if window == null:
+	if dock == null:
 		return
-	if window.visible:
-		window.hide()
+	if dock.visible:
+		dock.hide()
 	else:
-		window.popup_centered_ratio(0.7)
+		dock.show()

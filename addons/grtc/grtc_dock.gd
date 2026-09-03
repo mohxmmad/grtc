@@ -3,6 +3,7 @@ extends VBoxContainer
 
 const SERVER_DEFAULT = "http://localhost:8000"
 const PROJECT_SCAN_INTERVAL_MS = 2000
+const BIG_CHANGE_THRESHOLD_BYTES = 524288000
 
 var _http = null
 var _auth_http = null
@@ -33,12 +34,18 @@ var _project_snapshot = {}
 var _last_project_scan_at = 0
 var _ws_connected = false
 var _ws_connecting = false
+var _live_sync_enabled = true
+var _room_locked = false
+var _room_lock_reason = ""
+var _room_locked_by = ""
+var _push_required_changes = []
 var _client_instance_id = ""
 var _auto_apply_remote_changes = true
 var _pending_remote_changes = []
 var _remote_event_log = []
 
 var _status_label = null
+var _content_container = null
 var _server_edit = null
 var _email_edit = null
 var _session_edit = null
@@ -48,6 +55,9 @@ var _project_path_edit = null
 var _repo_url_edit = null
 var _collaboration_room_edit = null
 var _auto_apply_check = null
+var _lock_banner_label = null
+var _pending_push_label = null
+var _push_required_list = null
 var _remote_changes_list = null
 var _pending_count_label = null
 
@@ -97,40 +107,80 @@ func _restore_saved_session():
 		_set_status("Failed to restore saved session (%s)." % str(err), true)
 
 func _build_ui():
+	var scroll = ScrollContainer.new()
+	scroll.size_flags_horizontal = SIZE_EXPAND_FILL
+	scroll.size_flags_vertical = SIZE_EXPAND_FILL
+	add_child(scroll)
+
+	_content_container = VBoxContainer.new()
+	_content_container.size_flags_horizontal = SIZE_EXPAND_FILL
+	_content_container.size_flags_vertical = SIZE_EXPAND_FILL
+	_content_container.rect_min_size = Vector2(860, 0)
+	scroll.add_child(_content_container)
+
 	var title = Label.new()
 	title.text = "GRTC Collaboration"
-	add_child(title)
+	_ui_add(title)
 
 	var help = Label.new()
 	help.autowrap = true
-	help.text = "Godot editor-side GRTC panel. Login opens the backend OAuth page; Git push/pull runs locally from the current project folder; collaboration uses the websocket room for the active project."
-	add_child(help)
+	help.text = "Login with GitHub, then connect collaboration. Live sync follows the shared repo/project signature, auto-applies normal edits, and locks the room when a push-required change appears."
+	_ui_add(help)
 
 	_status_label = Label.new()
 	_status_label.autowrap = true
 	_status_label.rect_min_size = Vector2(0, 42)
-	add_child(_status_label)
+	_ui_add(_status_label)
 
 	parent_add(_row_line_edit("Server URL", true, _server_url, self, "_on_server_url_changed"), self)
-	_server_edit = get_child(get_child_count() - 1).get_child(1)
+	_server_edit = _content_container.get_child(_content_container.get_child_count() - 1).get_child(1)
 	parent_add(_row_line_edit("Your Email", true, _user_email, self, "_on_email_changed"), self)
-	_email_edit = get_child(get_child_count() - 1).get_child(1)
+	_email_edit = _content_container.get_child(_content_container.get_child_count() - 1).get_child(1)
 	parent_add(_row_line_edit("Session ID", true, _session_id, self, "_on_session_changed"), self)
-	_session_edit = get_child(get_child_count() - 1).get_child(1)
+	_session_edit = _content_container.get_child(_content_container.get_child_count() - 1).get_child(1)
 	parent_add(_row_line_edit("User ID", true, _user_id, self, "_on_user_id_changed"), self)
-	_user_id_edit = get_child(get_child_count() - 1).get_child(1)
+	_user_id_edit = _content_container.get_child(_content_container.get_child_count() - 1).get_child(1)
 	parent_add(_row_line_edit("GitHub Username", true, _github_username, self, "_on_username_changed"), self)
-	_username_edit = get_child(get_child_count() - 1).get_child(1)
+	_username_edit = _content_container.get_child(_content_container.get_child_count() - 1).get_child(1)
 	parent_add(_row_line_edit("Project Path", true, _project_path, self, "_on_project_path_changed"), self)
-	_project_path_edit = get_child(get_child_count() - 1).get_child(1)
+	_project_path_edit = _content_container.get_child(_content_container.get_child_count() - 1).get_child(1)
 	parent_add(_row_line_edit("Repository URL", true, _current_repo_url, self, "_on_repo_url_changed"), self)
-	_repo_url_edit = get_child(get_child_count() - 1).get_child(1)
+	_repo_url_edit = _content_container.get_child(_content_container.get_child_count() - 1).get_child(1)
 	parent_add(_row_line_edit("Collab Room", false, _collaboration_room, self, ""), self)
-	_collaboration_room_edit = get_child(get_child_count() - 1).get_child(1)
+	_collaboration_room_edit = _content_container.get_child(_content_container.get_child_count() - 1).get_child(1)
+
+	_lock_banner_label = Label.new()
+	_lock_banner_label.autowrap = true
+	_lock_banner_label.rect_min_size = Vector2(0, 48)
+	_ui_add(_lock_banner_label)
+
+	var push_panel = VBoxContainer.new()
+	push_panel.size_flags_horizontal = SIZE_EXPAND_FILL
+	_ui_add(push_panel)
+
+	var push_title = Label.new()
+	push_title.text = "Push Required"
+	push_panel.add_child(push_title)
+
+	_pending_push_label = Label.new()
+	_pending_push_label.autowrap = true
+	_pending_push_label.text = "No push-required changes."
+	push_panel.add_child(_pending_push_label)
+
+	var push_actions = GridContainer.new()
+	push_actions.columns = 2
+	push_panel.add_child(push_actions)
+	_add_button(push_actions, "Push Required", self, "_on_push_required_pressed")
+
+	_push_required_list = ItemList.new()
+	_push_required_list.rect_min_size = Vector2(0, 120)
+	_push_required_list.size_flags_horizontal = SIZE_EXPAND_FILL
+	_push_required_list.size_flags_vertical = SIZE_EXPAND_FILL
+	push_panel.add_child(_push_required_list)
 
 	var remote_panel = VBoxContainer.new()
 	remote_panel.size_flags_horizontal = SIZE_EXPAND_FILL
-	add_child(remote_panel)
+	_ui_add(remote_panel)
 
 	var remote_title = Label.new()
 	remote_title.text = "Remote Collaboration"
@@ -146,7 +196,8 @@ func _build_ui():
 	_pending_count_label.text = "Pending changes: 0"
 	remote_panel.add_child(_pending_count_label)
 
-	var remote_actions = HBoxContainer.new()
+	var remote_actions = GridContainer.new()
+	remote_actions.columns = 2
 	remote_panel.add_child(remote_actions)
 	_add_button(remote_actions, "Apply Pending", self, "_apply_pending_remote_changes")
 	_add_button(remote_actions, "Clear Queue", self, "_clear_pending_remote_changes")
@@ -157,8 +208,9 @@ func _build_ui():
 	_remote_changes_list.size_flags_vertical = SIZE_EXPAND_FILL
 	remote_panel.add_child(_remote_changes_list)
 
-	var actions = HBoxContainer.new()
-	add_child(actions)
+	var actions = GridContainer.new()
+	actions.columns = 2
+	_ui_add(actions)
 	_add_button(actions, "Login with GitHub", self, "_on_login_pressed")
 	_add_button(actions, "Connect Collaboration", self, "_on_connect_collaboration_pressed")
 	_add_button(actions, "Disconnect Collaboration", self, "_on_disconnect_collaboration_pressed")
@@ -168,7 +220,16 @@ func _build_ui():
 	_add_button(actions, "Pull Changes", self, "_on_pull_pressed")
 
 func parent_add(node, _owner):
-	add_child(node)
+	if _content_container:
+		_content_container.add_child(node)
+	else:
+		add_child(node)
+
+func _ui_add(node):
+	if _content_container:
+		_content_container.add_child(node)
+	else:
+		add_child(node)
 
 func _row_line_edit(label_text, editable, value, target, method_name):
 	var row = HBoxContainer.new()
@@ -205,6 +266,8 @@ func _refresh_fields():
 	_set_line_edit(_collaboration_room_edit, _collaboration_room)
 	if _auto_apply_check:
 		_auto_apply_check.set_pressed_no_signal(_auto_apply_remote_changes)
+	_refresh_lock_banner()
+	_refresh_push_required_ui()
 	_refresh_pending_remote_ui()
 
 func _set_line_edit(node, value):
@@ -346,7 +409,12 @@ func _on_push_pressed():
 	_busy = false
 	if result.get("code", 0) == 0:
 		_set_status("Changes pushed to GitHub.")
+		_push_required_changes.clear()
+		_refresh_push_required_ui()
 		_refresh_project_files()
+		if _ws_connected:
+			_send_ws_json({"type": "push_complete", "room": _collaboration_room, "data": {"client_id": _client_instance_id}})
+			_notify_client_synced()
 	else:
 		_set_status(_join_lines(result.get("output", ["Git push failed"])) , true)
 
@@ -374,8 +442,8 @@ func _on_pull_pressed():
 	_busy = false
 	if result.get("code", 0) == 0:
 		_set_status("Latest changes pulled from GitHub.")
-		_scan_and_broadcast_changes(true)
 		_refresh_project_files()
+		_notify_client_synced()
 	else:
 		_set_status(_join_lines(result.get("output", ["Git pull failed"])) , true)
 
@@ -384,6 +452,7 @@ func _refresh_project_files():
 	_refresh_fields()
 	if _editor_interface:
 		_editor_interface.get_resource_filesystem().scan()
+	_project_snapshot = _scan_project_snapshot()
 	_set_status("Project files refreshed.")
 
 func _open_repository():
@@ -393,9 +462,12 @@ func _open_repository():
 	OS.shell_open(_current_repo_url)
 
 func _project_root():
-	if _project_path != "":
+	if _project_path != "" and Directory.new().dir_exists(_project_path):
 		return _project_path
-	return ProjectSettings.globalize_path("res://")
+	var res_path = ProjectSettings.globalize_path("res://")
+	if Directory.new().dir_exists(res_path):
+		return res_path
+	return ""
 
 func _resolve_repo_url():
 	var project_path = _project_root()
@@ -417,6 +489,11 @@ func _on_connect_collaboration_pressed():
 	if _collaboration_room == "":
 		_set_status("Unable to derive a collaboration room.", true)
 		return
+	_room_locked = false
+	_room_lock_reason = ""
+	_room_locked_by = ""
+	_live_sync_enabled = true
+	_refresh_lock_banner()
 	var ws_url = _collaboration_ws_url()
 	_ws = WebSocketClient.new()
 	var err = _ws.connect("connection_established", self, "_on_ws_connection_established")
@@ -495,8 +572,20 @@ func _handle_ws_message(message):
 	var message_type = str(message.get("type", ""))
 	if message_type == "event":
 		_handle_remote_event(message)
+	elif message_type == "room_joined":
+		_apply_lock_state_from_message(message)
+	elif message_type == "room_left":
+		_apply_lock_state_from_message(message)
 	elif message_type == "sync_state":
+		_apply_lock_state_from_message(message)
 		print("[GRTC][WS] Sync state: ", message)
+	elif message_type == "sync_paused":
+		_apply_lock_state_from_message(message)
+		_set_status("Room locked: %s" % _room_lock_reason, true)
+	elif message_type == "sync_resumed":
+		_apply_lock_state_from_message(message)
+		_set_status("Room unlocked. Live sync resumed.")
+		_refresh_lock_banner()
 	elif message_type == "error":
 		_set_status(str(message.get("message", "Websocket error")), true)
 
@@ -516,6 +605,68 @@ func _handle_remote_event(message):
 		"source_client_id": source_id
 	}
 	_queue_or_apply_remote_change(change)
+
+func _apply_lock_state_from_message(message):
+	var data = message.get("data", {})
+	if typeof(data) != TYPE_DICTIONARY:
+		data = {}
+	var lock_data = data.get("room_lock", data.get("lock", data))
+	if typeof(lock_data) != TYPE_DICTIONARY:
+		lock_data = {}
+	_room_locked = bool(lock_data.get("locked", false))
+	_room_lock_reason = str(lock_data.get("reason", ""))
+	_room_locked_by = str(lock_data.get("locked_by_username", lock_data.get("locked_by_user_id", "")))
+	if not _room_locked:
+		_room_lock_reason = ""
+		_room_locked_by = ""
+	_live_sync_enabled = not _room_locked
+	_refresh_lock_banner()
+	_refresh_push_required_ui()
+	if _room_locked:
+		_set_status("Live sync paused: %s" % (_room_lock_reason if _room_lock_reason != "" else "room locked"), true)
+
+func _refresh_lock_banner():
+	if _lock_banner_label == null:
+		return
+	if _room_locked:
+		var locker = _room_locked_by if _room_locked_by != "" else "another collaborator"
+		var reason = _room_lock_reason if _room_lock_reason != "" else "push required"
+		_lock_banner_label.text = "LIVE SYNC PAUSED\nLocked by: %s\nReason: %s\nDo not make further changes until the push is resolved and everyone has pulled." % [locker, reason]
+		_lock_banner_label.add_color_override("font_color", Color(1, 0.35, 0.35))
+	else:
+		_lock_banner_label.text = "Live sync active."
+		_lock_banner_label.add_color_override("font_color", Color(0.75, 1, 0.75))
+
+func _refresh_push_required_ui():
+	if _pending_push_label:
+		if _push_required_changes.size() == 0:
+			_pending_push_label.text = "No push-required changes."
+		else:
+			_pending_push_label.text = "%d push-required change(s) queued." % _push_required_changes.size()
+	if _push_required_list == null:
+		return
+	_push_required_list.clear()
+	for change in _push_required_changes:
+		var label = "%s | %s MB" % [str(change.get("path", "unknown")), str(change.get("size_mb", "0"))]
+		_push_required_list.add_item(label)
+
+func _queue_push_required_change(change):
+	_push_required_changes.append(change)
+	_refresh_push_required_ui()
+	_room_locked = true
+	_live_sync_enabled = false
+	_refresh_lock_banner()
+	_set_status("Push required: %s" % str(change.get("path", "unknown file")), true)
+
+func _on_push_required_pressed():
+	if _push_required_changes.size() == 0:
+		_set_status("No push-required changes queued.")
+		return
+	_on_push_pressed()
+
+func _notify_client_synced():
+	if _ws_connected:
+		_send_ws_json({"type": "client_synced", "room": _collaboration_room, "data": {"client_id": _client_instance_id}})
 
 func _queue_or_apply_remote_change(change):
 	_append_remote_log(change)
@@ -589,7 +740,10 @@ func _apply_remote_change(change):
 		_refresh_fields()
 		if _editor_interface:
 			_editor_interface.get_resource_filesystem().scan()
-		_set_status("Applied remote %s: %s" % [event_type, relative_path])
+		if relative_path == "project.godot":
+			_set_status("Applied remote %s: %s. Restart the editor if project settings do not refresh immediately." % [event_type, relative_path])
+		else:
+			_set_status("Applied remote %s: %s" % [event_type, relative_path])
 
 func _resolve_project_file_path(relative_path):
 	var path = relative_path.strip_edges()
@@ -632,7 +786,7 @@ func _send_ws_json(payload):
 	peer.put_packet(to_json(payload).to_utf8())
 
 func _poll_project_changes():
-	if not _ws_connected:
+	if not _ws_connected or not _live_sync_enabled or _room_locked:
 		return
 	var now = OS.get_ticks_msec()
 	if now - _last_project_scan_at < PROJECT_SCAN_INTERVAL_MS:
@@ -646,11 +800,17 @@ func _scan_and_broadcast_changes(force):
 	if changes.size() == 0:
 		return
 	_project_snapshot = current_snapshot
-	if not _ws_connected and not force:
+	if (not _ws_connected or not _live_sync_enabled or _room_locked) and not force:
 		return
+	var broadcasted = 0
 	for change in changes:
+		if _is_big_change(change, current_snapshot):
+			_request_push_required(change, current_snapshot)
+			break
 		_broadcast_file_change(change)
-	_set_status("Broadcasted %d project change(s)." % changes.size())
+		broadcasted += 1
+	if broadcasted > 0:
+		_set_status("Broadcasted %d project change(s)." % broadcasted)
 
 func _broadcast_file_change(change):
 	var path = str(change.get("path", ""))
@@ -670,6 +830,7 @@ func _broadcast_file_change(change):
 		"project_path": _project_path,
 		"repo_url": _current_repo_url,
 		"kind": event_type,
+		"size_bytes": int(change.get("size_bytes", 0)),
 		"source_client_id": _client_instance_id
 	}
 	if event_type != "file_deleted":
@@ -682,10 +843,54 @@ func _broadcast_file_change(change):
 		"data": data
 	})
 
+func _request_push_required(change, snapshot):
+	var path = str(change.get("path", ""))
+	if path == "":
+		return
+	var size_bytes = int(change.get("size_bytes", 0))
+	var size_mb = float(size_bytes) / 1048576.0
+	var push_item = {
+		"path": _to_project_relative_path(path),
+		"size_bytes": size_bytes,
+		"size_mb": stepify(size_mb, 0.01),
+		"reason": "single change exceeds 500MB",
+		"kind": str(change.get("kind", "modified"))
+	}
+	var already_present = false
+	for existing in _push_required_changes:
+		if str(existing.get("path", "")) == str(push_item.get("path", "")):
+			already_present = true
+			break
+	if not already_present:
+		_queue_push_required_change(push_item)
+	if _ws_connected:
+		_send_ws_json({
+			"type": "push_required",
+			"room": _collaboration_room,
+			"event": "push_required",
+			"data": {
+				"required_path": push_item["path"],
+				"required_bytes": size_bytes,
+				"reason": push_item["reason"],
+				"source_client_id": _client_instance_id
+			}
+		})
+
+func _is_big_change(change, snapshot):
+	var size_bytes = int(change.get("size_bytes", 0))
+	if size_bytes <= 0:
+		var path = str(change.get("path", ""))
+		if path == "":
+			return false
+		var file_info = snapshot.get(path, {})
+		if typeof(file_info) == TYPE_DICTIONARY:
+			size_bytes = int(file_info.get("size_bytes", 0))
+	return size_bytes > BIG_CHANGE_THRESHOLD_BYTES
+
 func _scan_project_snapshot():
 	var snapshot = {}
 	var root_path = _project_root()
-	if root_path == "":
+	if root_path == "" or not Directory.new().dir_exists(root_path):
 		return snapshot
 	_scan_directory_recursive(root_path, snapshot)
 	return snapshot
@@ -703,11 +908,28 @@ func _scan_directory_recursive(path, snapshot):
 			continue
 		var full_path = path.plus_file(name)
 		if dir.current_is_dir():
+			if not _is_valid_directory(full_path):
+				continue
 			_scan_directory_recursive(full_path, snapshot)
 		else:
 			var file = File.new()
-			snapshot[full_path] = str(file.get_modified_time(full_path))
+			if file.open(full_path, File.READ) == OK:
+				snapshot[full_path] = {
+					"modified_time": file.get_modified_time(full_path),
+					"size_bytes": file.get_len()
+				}
+				file.close()
 	dir.list_dir_end()
+
+func _is_valid_directory(path):
+	var dir = Directory.new()
+	if not dir.dir_exists(path):
+		return false
+	if path.begins_with("/proc") or path.begins_with("/sys") or path.begins_with("/dev") or path.begins_with("/run"):
+		return false
+	if path.ends_with("/.git") or path.ends_with("/.godot") or path.ends_with("/.import") or path.ends_with("/.mono"):
+		return false
+	return true
 
 func _is_ignored_entry(path, name, is_dir):
 	if name == "." or name == "..":
@@ -722,16 +944,29 @@ func _diff_snapshots(old_snapshot, new_snapshot):
 	var changes = []
 	for path in new_snapshot.keys():
 		if not old_snapshot.has(path):
-			changes.append({"kind": "created", "path": path})
-		elif str(old_snapshot[path]) != str(new_snapshot[path]):
-			changes.append({"kind": "modified", "path": path})
+			var info = new_snapshot[path]
+			changes.append({"kind": "created", "path": path, "size_bytes": int(info.get("size_bytes", 0))})
+		else:
+			var old_info = old_snapshot[path]
+			var new_info = new_snapshot[path]
+			if typeof(old_info) == TYPE_DICTIONARY and typeof(new_info) == TYPE_DICTIONARY:
+				if int(old_info.get("modified_time", 0)) != int(new_info.get("modified_time", 0)) or int(old_info.get("size_bytes", 0)) != int(new_info.get("size_bytes", 0)):
+					changes.append({"kind": "modified", "path": path, "size_bytes": int(new_info.get("size_bytes", 0))})
+			elif str(old_info) != str(new_info):
+				changes.append({"kind": "modified", "path": path, "size_bytes": int(new_info.get("size_bytes", 0))})
 	for path in old_snapshot.keys():
 		if not new_snapshot.has(path):
-			changes.append({"kind": "deleted", "path": path})
+			var old_info = old_snapshot[path]
+			var deleted_size = 0
+			if typeof(old_info) == TYPE_DICTIONARY:
+				deleted_size = int(old_info.get("size_bytes", 0))
+			changes.append({"kind": "deleted", "path": path, "size_bytes": deleted_size})
 	return changes
 
 func _read_file_as_base64(path):
 	var file = File.new()
+	if not file.file_exists(path):
+		return ""
 	if file.open(path, File.READ) != OK:
 		return ""
 	var bytes = file.get_buffer(file.get_len())
@@ -748,14 +983,51 @@ func _to_project_relative_path(path):
 	return path
 
 func _refresh_collaboration_room():
-	var room_seed = _current_repo_url
-	if room_seed == "":
-		room_seed = _project_root()
+	var room_seed = _repo_identity_key()
 	if room_seed == "":
 		_collaboration_room = ""
 	else:
 		_collaboration_room = "project:" + room_seed.md5_text()
 	_set_line_edit(_collaboration_room_edit, _collaboration_room)
+
+func _repo_identity_key():
+	var remote_url = _normalize_repo_url(_resolve_repo_url())
+	if remote_url != "":
+		return remote_url
+	var project_signature = _project_signature()
+	if project_signature != "":
+		return project_signature
+	return _project_root()
+
+func _normalize_repo_url(url):
+	var normalized = url.strip_edges().to_lower()
+	if normalized == "":
+		return ""
+	if normalized.begins_with("git@"):
+		var parts = normalized.split(":")
+		if parts.size() == 2:
+			normalized = "https://" + parts[0].split("@")[1] + "/" + parts[1]
+	if normalized.begins_with("ssh://git@"):
+		normalized = normalized.replace("ssh://git@", "https://")
+	if normalized.begins_with("https://") or normalized.begins_with("http://"):
+		var slash = normalized.find("@")
+		if slash != -1 and normalized.find("//") != -1 and slash > normalized.find("//"):
+			var scheme_end = normalized.find("//") + 2
+			normalized = normalized.substr(0, scheme_end) + normalized.substr(slash + 1, normalized.length() - slash - 1)
+	if normalized.ends_with(".git"):
+		normalized = normalized.substr(0, normalized.length() - 4)
+	return normalized
+
+func _project_signature():
+	var file = File.new()
+	var project_file = _project_root().plus_file("project.godot")
+	if not File.new().file_exists(project_file):
+		return ""
+	if file.open(project_file, File.READ) != OK:
+		return ""
+	var contents = file.get_as_text()
+	file.close()
+	return contents.md5_text()
 
 func _generate_client_instance_id():
 	var rng = RandomNumberGenerator.new()
