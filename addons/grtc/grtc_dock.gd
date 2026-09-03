@@ -2,8 +2,7 @@ tool
 extends VBoxContainer
 
 const SERVER_DEFAULT = "http://localhost:8000"
-const PROJECT_SCAN_INTERVAL_MS = 2000
-const BIG_CHANGE_THRESHOLD_BYTES = 524288000
+const PROJECT_SCAN_INTERVAL_MS = 1000
 
 var _http = null
 var _auth_http = null
@@ -34,15 +33,14 @@ var _project_snapshot = {}
 var _last_project_scan_at = 0
 var _ws_connected = false
 var _ws_connecting = false
-var _live_sync_enabled = true
-var _room_locked = false
-var _room_lock_reason = ""
-var _room_locked_by = ""
-var _push_required_changes = []
 var _client_instance_id = ""
 var _auto_apply_remote_changes = true
 var _pending_remote_changes = []
 var _remote_event_log = []
+var _push_required_changes = []
+var _debug_live = true
+var _last_live_state = {}
+var _applying_live = false
 
 var _status_label = null
 var _content_container = null
@@ -60,6 +58,9 @@ var _pending_push_label = null
 var _push_required_list = null
 var _remote_changes_list = null
 var _pending_count_label = null
+var _unified_log_list = null
+var _unified_log = []
+var _seq_counter = 0
 
 func set_editor_interface(editor_interface):
 	_editor_interface = editor_interface
@@ -93,6 +94,7 @@ func _process(delta):
 			_poll_latest_auth()
 	_poll_websocket()
 	_poll_project_changes()
+	_poll_live_scene()
 
 func _restore_saved_session():
 	if _session_id == "":
@@ -124,7 +126,7 @@ func _build_ui():
 
 	var help = Label.new()
 	help.autowrap = true
-	help.text = "Login with GitHub, then connect collaboration. Live sync follows the shared repo/project signature, auto-applies normal edits, and locks the room when a push-required change appears."
+	help.text = "Login with GitHub, then Connect Collaboration. All edits auto-apply live to everyone in the same room (same repo)."
 	_ui_add(help)
 
 	_status_label = Label.new()
@@ -151,62 +153,37 @@ func _build_ui():
 
 	_lock_banner_label = Label.new()
 	_lock_banner_label.autowrap = true
-	_lock_banner_label.rect_min_size = Vector2(0, 48)
+	_lock_banner_label.rect_min_size = Vector2(0, 32)
 	_ui_add(_lock_banner_label)
 
-	var push_panel = VBoxContainer.new()
-	push_panel.size_flags_horizontal = SIZE_EXPAND_FILL
-	_ui_add(push_panel)
+	# Single unified live log - shows all OUT and IN in order
+	var log_panel = VBoxContainer.new()
+	log_panel.size_flags_horizontal = SIZE_EXPAND_FILL
+	log_panel.size_flags_vertical = SIZE_EXPAND_FILL
+	_ui_add(log_panel)
 
-	var push_title = Label.new()
-	push_title.text = "Push Required"
-	push_panel.add_child(push_title)
+	var log_title = Label.new()
+	log_title.text = "Live Changes (OUT = you sent, IN = you received) - in order applied"
+	log_panel.add_child(log_title)
 
-	_pending_push_label = Label.new()
-	_pending_push_label.autowrap = true
-	_pending_push_label.text = "No push-required changes."
-	push_panel.add_child(_pending_push_label)
+	var log_help = Label.new()
+	log_help.autowrap = true
+	log_help.text = "Each entry: [time] DIR  event  path  (scene/object)"
+	log_help.add_color_override("font_color", Color(0.7,0.7,0.7))
+	log_panel.add_child(log_help)
 
-	var push_actions = GridContainer.new()
-	push_actions.columns = 2
-	push_panel.add_child(push_actions)
-	_add_button(push_actions, "Push Required", self, "_on_push_required_pressed")
+	_unified_log_list = ItemList.new()
+	_unified_log_list.rect_min_size = Vector2(0, 220)
+	_unified_log_list.size_flags_horizontal = SIZE_EXPAND_FILL
+	_unified_log_list.size_flags_vertical = SIZE_EXPAND_FILL
+	_unified_log_list.allow_reselect = true
+	log_panel.add_child(_unified_log_list)
 
-	_push_required_list = ItemList.new()
-	_push_required_list.rect_min_size = Vector2(0, 120)
-	_push_required_list.size_flags_horizontal = SIZE_EXPAND_FILL
-	_push_required_list.size_flags_vertical = SIZE_EXPAND_FILL
-	push_panel.add_child(_push_required_list)
-
-	var remote_panel = VBoxContainer.new()
-	remote_panel.size_flags_horizontal = SIZE_EXPAND_FILL
-	_ui_add(remote_panel)
-
-	var remote_title = Label.new()
-	remote_title.text = "Remote Collaboration"
-	remote_panel.add_child(remote_title)
-
-	_auto_apply_check = CheckBox.new()
-	_auto_apply_check.text = "Auto Apply Remote Changes"
-	_auto_apply_check.set_pressed_no_signal(_auto_apply_remote_changes)
-	_auto_apply_check.connect("toggled", self, "_on_auto_apply_toggled")
-	remote_panel.add_child(_auto_apply_check)
-
-	_pending_count_label = Label.new()
-	_pending_count_label.text = "Pending changes: 0"
-	remote_panel.add_child(_pending_count_label)
-
-	var remote_actions = GridContainer.new()
-	remote_actions.columns = 2
-	remote_panel.add_child(remote_actions)
-	_add_button(remote_actions, "Apply Pending", self, "_apply_pending_remote_changes")
-	_add_button(remote_actions, "Clear Queue", self, "_clear_pending_remote_changes")
-
-	_remote_changes_list = ItemList.new()
-	_remote_changes_list.rect_min_size = Vector2(0, 120)
-	_remote_changes_list.size_flags_horizontal = SIZE_EXPAND_FILL
-	_remote_changes_list.size_flags_vertical = SIZE_EXPAND_FILL
-	remote_panel.add_child(_remote_changes_list)
+	var log_actions = GridContainer.new()
+	log_actions.columns = 2
+	log_panel.add_child(log_actions)
+	_add_button(log_actions, "Clear Log", self, "_clear_unified_log")
+	_add_button(log_actions, "Copy Log", self, "_copy_unified_log")
 
 	var actions = GridContainer.new()
 	actions.columns = 2
@@ -264,11 +241,8 @@ func _refresh_fields():
 	_set_line_edit(_project_path_edit, _project_path)
 	_set_line_edit(_repo_url_edit, _current_repo_url)
 	_set_line_edit(_collaboration_room_edit, _collaboration_room)
-	if _auto_apply_check:
-		_auto_apply_check.set_pressed_no_signal(_auto_apply_remote_changes)
 	_refresh_lock_banner()
-	_refresh_push_required_ui()
-	_refresh_pending_remote_ui()
+	_refresh_unified_log_ui()
 
 func _set_line_edit(node, value):
 	if node and node.text != value:
@@ -316,9 +290,11 @@ func _on_repo_url_changed(text):
 	_save_state()
 
 func _on_auto_apply_toggled(button_pressed):
-	_auto_apply_remote_changes = button_pressed
+	_auto_apply_remote_changes = true
+	if _auto_apply_check:
+		_auto_apply_check.set_pressed_no_signal(true)
 	_save_state()
-	_set_status("Auto apply %s." % ("enabled" if _auto_apply_remote_changes else "disabled"))
+	_set_status("Live sync is always auto-apply")
 
 func _on_login_pressed():
 	print("[GRTC] Login button pressed, email: '", _user_email, "'")
@@ -409,12 +385,7 @@ func _on_push_pressed():
 	_busy = false
 	if result.get("code", 0) == 0:
 		_set_status("Changes pushed to GitHub.")
-		_push_required_changes.clear()
-		_refresh_push_required_ui()
 		_refresh_project_files()
-		if _ws_connected:
-			_send_ws_json({"type": "push_complete", "room": _collaboration_room, "data": {"client_id": _client_instance_id}})
-			_notify_client_synced()
 	else:
 		_set_status(_join_lines(result.get("output", ["Git push failed"])) , true)
 
@@ -443,7 +414,6 @@ func _on_pull_pressed():
 	if result.get("code", 0) == 0:
 		_set_status("Latest changes pulled from GitHub.")
 		_refresh_project_files()
-		_notify_client_synced()
 	else:
 		_set_status(_join_lines(result.get("output", ["Git pull failed"])) , true)
 
@@ -489,12 +459,10 @@ func _on_connect_collaboration_pressed():
 	if _collaboration_room == "":
 		_set_status("Unable to derive a collaboration room.", true)
 		return
-	_room_locked = false
-	_room_lock_reason = ""
-	_room_locked_by = ""
-	_live_sync_enabled = true
+	print("[GRTC] Connecting to room: ", _collaboration_room, " server: ", _server_url)
 	_refresh_lock_banner()
 	var ws_url = _collaboration_ws_url()
+	print("[GRTC] WS URL: ", ws_url)
 	_ws = WebSocketClient.new()
 	var err = _ws.connect("connection_established", self, "_on_ws_connection_established")
 	if err != OK:
@@ -541,9 +509,21 @@ func _on_ws_connection_established(protocol = ""):
 	_ws_connected = true
 	_ws_connecting = false
 	_set_status("Collaboration connected to %s." % _collaboration_room)
+	print("[GRTC] Connected, joining room: ", _collaboration_room)
 	_send_ws_json({"type": "join", "room": _collaboration_room})
 	_send_ws_json({"type": "sync_request"})
 	_project_snapshot = _scan_project_snapshot()
+	_last_live_state.clear()
+	# Init live state without broadcast
+	if _editor_interface:
+		var root = _editor_interface.get_edited_scene_root()
+		if root:
+			var scene_path = root.filename if root.filename != "" else "res://GRTC.tscn"
+			scene_path = scene_path.replace("res://", "")
+			var init = {}
+			_collect_live_nodes(root, root, init, scene_path)
+			_last_live_state = init
+	print("[GRTC] Snapshot taken, entries: ", _project_snapshot.size(), " live nodes: ", _last_live_state.size())
 
 func _on_ws_connection_error():
 	_ws_connected = false
@@ -570,22 +550,13 @@ func _on_ws_data_received():
 
 func _handle_ws_message(message):
 	var message_type = str(message.get("type", ""))
+	print("[GRTC][WS] Received: ", message)
 	if message_type == "event":
 		_handle_remote_event(message)
-	elif message_type == "room_joined":
-		_apply_lock_state_from_message(message)
-	elif message_type == "room_left":
-		_apply_lock_state_from_message(message)
 	elif message_type == "sync_state":
-		_apply_lock_state_from_message(message)
 		print("[GRTC][WS] Sync state: ", message)
-	elif message_type == "sync_paused":
-		_apply_lock_state_from_message(message)
-		_set_status("Room locked: %s" % _room_lock_reason, true)
-	elif message_type == "sync_resumed":
-		_apply_lock_state_from_message(message)
-		_set_status("Room unlocked. Live sync resumed.")
-		_refresh_lock_banner()
+	elif message_type == "room_joined":
+		_set_status("Joined room %s" % str(message.get("room", _collaboration_room)))
 	elif message_type == "error":
 		_set_status(str(message.get("message", "Websocket error")), true)
 
@@ -596,8 +567,14 @@ func _handle_remote_event(message):
 	var source_id = str(data.get("source_client_id", message.get("client_id", "")))
 	if source_id != "" and source_id == _client_instance_id:
 		return
+	var event_type = str(message.get("event", "file_updated"))
+	# Handle live node transform separately - apply directly to scene in memory
+	if event_type == "live_node":
+		_apply_live_node(data)
+		_log_unified("IN", {"type": event_type, "path": str(data.get("path", "")) + ":" + str(data.get("node_path", "")), "data": data})
+		return
 	var change = {
-		"type": str(message.get("event", "file_updated")),
+		"type": event_type,
 		"timestamp": str(message.get("timestamp", "")),
 		"path": str(data.get("path", data.get("file_path", ""))),
 		"project_room": str(message.get("room", _collaboration_room)),
@@ -606,109 +583,114 @@ func _handle_remote_event(message):
 	}
 	_queue_or_apply_remote_change(change)
 
-func _apply_lock_state_from_message(message):
-	var data = message.get("data", {})
-	if typeof(data) != TYPE_DICTIONARY:
-		data = {}
-	var lock_data = data.get("room_lock", data.get("lock", data))
-	if typeof(lock_data) != TYPE_DICTIONARY:
-		lock_data = {}
-	_room_locked = bool(lock_data.get("locked", false))
-	_room_lock_reason = str(lock_data.get("reason", ""))
-	_room_locked_by = str(lock_data.get("locked_by_username", lock_data.get("locked_by_user_id", "")))
-	if not _room_locked:
-		_room_lock_reason = ""
-		_room_locked_by = ""
-	_live_sync_enabled = not _room_locked
-	_refresh_lock_banner()
-	_refresh_push_required_ui()
-	if _room_locked:
-		_set_status("Live sync paused: %s" % (_room_lock_reason if _room_lock_reason != "" else "room locked"), true)
-
 func _refresh_lock_banner():
 	if _lock_banner_label == null:
 		return
-	if _room_locked:
-		var locker = _room_locked_by if _room_locked_by != "" else "another collaborator"
-		var reason = _room_lock_reason if _room_lock_reason != "" else "push required"
-		_lock_banner_label.text = "LIVE SYNC PAUSED\nLocked by: %s\nReason: %s\nDo not make further changes until the push is resolved and everyone has pulled." % [locker, reason]
-		_lock_banner_label.add_color_override("font_color", Color(1, 0.35, 0.35))
-	else:
-		_lock_banner_label.text = "Live sync active."
-		_lock_banner_label.add_color_override("font_color", Color(0.75, 1, 0.75))
-
-func _refresh_push_required_ui():
-	if _pending_push_label:
-		if _push_required_changes.size() == 0:
-			_pending_push_label.text = "No push-required changes."
-		else:
-			_pending_push_label.text = "%d push-required change(s) queued." % _push_required_changes.size()
-	if _push_required_list == null:
-		return
-	_push_required_list.clear()
-	for change in _push_required_changes:
-		var label = "%s | %s MB" % [str(change.get("path", "unknown")), str(change.get("size_mb", "0"))]
-		_push_required_list.add_item(label)
-
-func _queue_push_required_change(change):
-	_push_required_changes.append(change)
-	_refresh_push_required_ui()
-	_room_locked = true
-	_live_sync_enabled = false
-	_refresh_lock_banner()
-	_set_status("Push required: %s" % str(change.get("path", "unknown file")), true)
+	_lock_banner_label.text = "Live sync active - all changes auto-apply"
+	_lock_banner_label.add_color_override("font_color", Color(0.75, 1, 0.75))
 
 func _on_push_required_pressed():
-	if _push_required_changes.size() == 0:
-		_set_status("No push-required changes queued.")
-		return
+	_set_status("Push required is disabled - all changes auto-apply live")
+	return
 	_on_push_pressed()
 
-func _notify_client_synced():
-	if _ws_connected:
-		_send_ws_json({"type": "client_synced", "room": _collaboration_room, "data": {"client_id": _client_instance_id}})
-
 func _queue_or_apply_remote_change(change):
-	_append_remote_log(change)
-	if _auto_apply_remote_changes:
-		_apply_remote_change(change)
-		return
-	_pending_remote_changes.append(change)
-	_refresh_pending_remote_ui()
-	_set_status("Queued remote change for %s." % str(change.get("path", "unknown file")))
+	# Ensure strict order: append to log then apply in same order
+	_log_unified("IN", change)
+	_apply_remote_change(change)
 
-func _append_remote_log(change):
-	_remote_event_log.append(change)
+func _log_unified(dir, change):
+	_seq_counter += 1
+	var ts = OS.get_time()
+	var time_str = "%02d:%02d:%02d" % [ts.hour, ts.minute, ts.second]
+	var path = str(change.get("path", change.get("data", {}).get("path", "unknown")))
+	var data = change.get("data", {})
+	if typeof(data) != TYPE_DICTIONARY:
+		data = {}
+	if path == "unknown" and data.has("path"):
+		path = str(data["path"])
+	var event_type = str(change.get("type", data.get("kind", "file_updated")))
+	var scene = _extract_scene(path)
+	var obj = _extract_object(path, data)
+	var entry = "%04d [%s] %s  %s  %s  scene:%s  obj:%s" % [_seq_counter, time_str, dir, event_type, path, scene, obj]
+	_unified_log.append(entry)
+	_remote_event_log.append(change) # keep for compatibility
+	if _unified_log.size() > 200:
+		_unified_log.remove(0)
 	if _remote_event_log.size() > 25:
 		_remote_event_log.remove(0)
-	_refresh_remote_log_ui()
+	_refresh_unified_log_ui()
+	print("[GRTC][LOG] ", entry)
+
+func _log_outgoing(path, event_type, file_content_b64):
+	var d = {"path": path, "kind": event_type, "file_content": file_content_b64}
+	_log_unified("OUT", {"type": event_type, "path": path, "data": d})
+
+func _refresh_unified_log_ui():
+	if _unified_log_list == null:
+		return
+	_unified_log_list.clear()
+	for entry in _unified_log:
+		_unified_log_list.add_item(entry)
+	# auto scroll to last
+	if _unified_log_list.get_item_count() > 0:
+		_unified_log_list.ensure_current_is_visible()
+
+func _clear_unified_log():
+	_unified_log.clear()
+	_remote_event_log.clear()
+	_seq_counter = 0
+	_refresh_unified_log_ui()
+	_set_status("Log cleared")
+
+func _copy_unified_log():
+	var text = PoolStringArray(_unified_log).join("\n")
+	OS.clipboard = text
+	_set_status("Log copied (%d entries)" % _unified_log.size())
+
+func _extract_scene(path):
+	if path == "" or path == "unknown":
+		return "-"
+	var f = path.get_file()
+	if f == "":
+		return path
+	return f
+
+func _extract_object(path, data):
+	# Try to infer object from tscn content or path
+	if data.has("file_content") and str(data["file_content"]) != "":
+		var b64 = str(data["file_content"])
+		var bytes = Marshalls.base64_to_raw(b64)
+		var txt = bytes.get_string_from_utf8()
+		# Look for [node name="Something"] - first match or Cube
+		var idx = txt.find('name="')
+		if idx != -1:
+			var start = idx + 6
+			var end = txt.find('"', start)
+			if end != -1:
+				var name = txt.substr(start, end - start)
+				# If multiple nodes, try to find changed one near transform
+				# For now return first node name, or Cube if present
+				if txt.find('name="Cube"') != -1:
+					return "Cube"
+				return name
+	return path.get_file().get_basename()
+
+# Compatibility stubs - keep for old calls
+func _append_remote_log(change):
+	_log_unified("IN", change)
 
 func _refresh_remote_log_ui():
-	if _remote_changes_list == null:
-		return
-	_remote_changes_list.clear()
-	for change in _remote_event_log:
-		var label = "%s | %s" % [str(change.get("type", "event")), str(change.get("path", "unknown"))]
-		_remote_changes_list.add_item(label)
+	_refresh_unified_log_ui()
 
 func _refresh_pending_remote_ui():
-	if _pending_count_label:
-		_pending_count_label.text = "Pending changes: %d" % _pending_remote_changes.size()
+	pass
 
 func _clear_pending_remote_changes():
-	_pending_remote_changes.clear()
-	_refresh_pending_remote_ui()
-	_set_status("Pending remote changes cleared.")
+	_clear_unified_log()
 
 func _apply_pending_remote_changes():
-	if _pending_remote_changes.size() == 0:
-		_set_status("No pending remote changes.")
-		return
-	for change in _pending_remote_changes:
-		_apply_remote_change(change)
-	_pending_remote_changes.clear()
-	_refresh_pending_remote_ui()
-	_set_status("Applied pending remote changes.")
+	_set_status("Auto-apply is always on")
 
 func _apply_remote_change(change):
 	var event_type = str(change.get("type", "file_updated"))
@@ -740,10 +722,35 @@ func _apply_remote_change(change):
 		_refresh_fields()
 		if _editor_interface:
 			_editor_interface.get_resource_filesystem().scan()
+			_editor_interface.get_resource_filesystem().scan_sources()
+			# Force reload if the changed file is the currently edited scene or resource
+			var res_path = "res://" + relative_path
+			# Try to reload resource from disk
+			if ResourceLoader.has_cached(res_path):
+				# Clear cache by taking resource and forcing reload via load with no_cache
+				var _r = load(res_path)
+				if _r != null:
+					print("[GRTC] Reloaded resource: ", res_path)
+			# If edited scene is this file, reopen it
+			var edited = _editor_interface.get_edited_scene_root()
+			if edited != null and edited.filename == res_path:
+				print("[GRTC] Reopening edited scene: ", res_path)
+				_editor_interface.open_scene_from_path(res_path)
+			elif relative_path.get_extension() in ["tscn", "scn", "gd", "tres", "res"]:
+				# For other scene files not currently edited, just ensure FileSystem updated
+				# Also try to reload if any open scene depends on it - best effort scan
+				pass
+			# Also force editor to update file system dock
+			call_deferred("_deferred_scan")
 		if relative_path == "project.godot":
-			_set_status("Applied remote %s: %s. Restart the editor if project settings do not refresh immediately." % [event_type, relative_path])
+			_set_status("Applied remote %s: %s. Restart editor if project settings don't refresh." % [event_type, relative_path])
 		else:
-			_set_status("Applied remote %s: %s" % [event_type, relative_path])
+			_set_status("Applied remote %s: %s (reloaded)" % [event_type, relative_path])
+		print("[GRTC] Applied and reloaded: ", relative_path, " -> ", local_path)
+
+func _deferred_scan():
+	if _editor_interface:
+		_editor_interface.get_resource_filesystem().scan()
 
 func _resolve_project_file_path(relative_path):
 	var path = relative_path.strip_edges()
@@ -779,14 +786,17 @@ func _delete_local_file(path):
 
 func _send_ws_json(payload):
 	if _ws == null or not _ws_connected:
+		print("[GRTC] Not connected, cannot send: ", payload)
 		return
 	var peer = _ws.get_peer(1)
 	if peer == null:
+		print("[GRTC] No peer, cannot send")
 		return
 	peer.put_packet(to_json(payload).to_utf8())
+	print("[GRTC] Sent: ", payload)
 
 func _poll_project_changes():
-	if not _ws_connected or not _live_sync_enabled or _room_locked:
+	if not _ws_connected:
 		return
 	var now = OS.get_ticks_msec()
 	if now - _last_project_scan_at < PROJECT_SCAN_INTERVAL_MS:
@@ -799,18 +809,17 @@ func _scan_and_broadcast_changes(force):
 	var changes = _diff_snapshots(_project_snapshot, current_snapshot)
 	if changes.size() == 0:
 		return
+	print("[GRTC] Detected changes: ", changes)
 	_project_snapshot = current_snapshot
-	if (not _ws_connected or not _live_sync_enabled or _room_locked) and not force:
+	if not _ws_connected and not force:
 		return
 	var broadcasted = 0
 	for change in changes:
-		if _is_big_change(change, current_snapshot):
-			_request_push_required(change, current_snapshot)
-			break
 		_broadcast_file_change(change)
 		broadcasted += 1
 	if broadcasted > 0:
 		_set_status("Broadcasted %d project change(s)." % broadcasted)
+		print("[GRTC] Broadcasted ", broadcasted, " changes")
 
 func _broadcast_file_change(change):
 	var path = str(change.get("path", ""))
@@ -824,6 +833,9 @@ func _broadcast_file_change(change):
 		event_type = "file_deleted"
 	else:
 		event_type = "file_updated"
+	var b64 = ""
+	if event_type != "file_deleted":
+		b64 = _read_file_as_base64(path)
 	var data = {
 		"path": relative_path,
 		"project_room": _collaboration_room,
@@ -834,8 +846,10 @@ func _broadcast_file_change(change):
 		"source_client_id": _client_instance_id
 	}
 	if event_type != "file_deleted":
-		data["file_content"] = _read_file_as_base64(path)
+		data["file_content"] = b64
 		data["file_encoding"] = "base64"
+	# Log OUT before send - keeps order
+	_log_unified("OUT", {"type": event_type, "path": relative_path, "data": data})
 	_send_ws_json({
 		"type": "publish",
 		"room": _collaboration_room,
@@ -844,48 +858,112 @@ func _broadcast_file_change(change):
 	})
 
 func _request_push_required(change, snapshot):
-	var path = str(change.get("path", ""))
-	if path == "":
-		return
-	var size_bytes = int(change.get("size_bytes", 0))
-	var size_mb = float(size_bytes) / 1048576.0
-	var push_item = {
-		"path": _to_project_relative_path(path),
-		"size_bytes": size_bytes,
-		"size_mb": stepify(size_mb, 0.01),
-		"reason": "single change exceeds 500MB",
-		"kind": str(change.get("kind", "modified"))
-	}
-	var already_present = false
-	for existing in _push_required_changes:
-		if str(existing.get("path", "")) == str(push_item.get("path", "")):
-			already_present = true
-			break
-	if not already_present:
-		_queue_push_required_change(push_item)
-	if _ws_connected:
-		_send_ws_json({
-			"type": "push_required",
-			"room": _collaboration_room,
-			"event": "push_required",
-			"data": {
-				"required_path": push_item["path"],
-				"required_bytes": size_bytes,
-				"reason": push_item["reason"],
-				"source_client_id": _client_instance_id
-			}
-		})
+	# Disabled - all changes auto-apply live
+	return
 
 func _is_big_change(change, snapshot):
-	var size_bytes = int(change.get("size_bytes", 0))
-	if size_bytes <= 0:
-		var path = str(change.get("path", ""))
-		if path == "":
-			return false
-		var file_info = snapshot.get(path, {})
-		if typeof(file_info) == TYPE_DICTIONARY:
-			size_bytes = int(file_info.get("size_bytes", 0))
-	return size_bytes > BIG_CHANGE_THRESHOLD_BYTES
+	return false
+
+func _poll_live_scene():
+	if not _ws_connected or _applying_live:
+		return
+	if _editor_interface == null:
+		return
+	var root = _editor_interface.get_edited_scene_root()
+	if root == null:
+		return
+	var scene_path = root.filename
+	if scene_path == "":
+		scene_path = "res://GRTC.tscn"
+	else:
+		scene_path = scene_path.replace("res://", "")
+	var current = {}
+	_collect_live_nodes(root, root, current, scene_path)
+	# Compare
+	for node_path in current.keys():
+		var cur = str(current[node_path])
+		var prev = str(_last_live_state.get(node_path, ""))
+		if prev != cur and prev != "":
+			# Changed - broadcast live
+			_broadcast_live_node(scene_path, node_path, cur)
+	for node_path in current.keys():
+		if not _last_live_state.has(node_path):
+			# New node, init without broadcast
+			pass
+	_last_live_state = current
+
+func _collect_live_nodes(root, node, dict, scene_path):
+	if node != root:
+		var np = str(root.get_path_to(node))
+		if node is Spatial:
+			var t = node.translation
+			var r = node.rotation_degrees
+			var s = node.scale
+			dict[np] = "T:%.3f,%.3f,%.3f|R:%.3f,%.3f,%.3f|S:%.3f,%.3f,%.3f" % [t.x, t.y, t.z, r.x, r.y, r.z, s.x, s.y, s.z]
+		elif node is Control:
+			var p = node.rect_position if "rect_position" in node else Vector2()
+			dict[np] = "P:%.1f,%.1f" % [p.x, p.y]
+	for child in node.get_children():
+		_collect_live_nodes(root, child, dict, scene_path)
+
+func _broadcast_live_node(scene_path, node_path, state_str):
+	var parts = state_str.split("|")
+	var t_str = parts[0] if parts.size() > 0 else ""
+	var r_str = parts[1] if parts.size() > 1 else ""
+	var s_str = parts[2] if parts.size() > 2 else ""
+	var data = {
+		"path": scene_path,
+		"scene": scene_path,
+		"node_path": node_path,
+		"object": node_path.get_file() if node_path.find("/") == -1 else node_path.split("/")[-1],
+		"state": state_str,
+		"source_client_id": _client_instance_id
+	}
+	_log_unified("OUT", {"type": "live_node", "path": scene_path + ":" + node_path, "data": data})
+	_send_ws_json({
+		"type": "publish",
+		"room": _collaboration_room,
+		"event": "live_node",
+		"data": data
+	})
+	print("[GRTC] Live broadcast ", node_path, " -> ", state_str)
+
+func _apply_live_node(data):
+	if _editor_interface == null:
+		return
+	var scene_path = str(data.get("path", "GRTC.tscn"))
+	var node_path = str(data.get("node_path", ""))
+	var state_str = str(data.get("state", ""))
+	if node_path == "" or state_str == "":
+		return
+	var res_path = "res://" + scene_path
+	var root = _editor_interface.get_edited_scene_root()
+	if root == null or root.filename != res_path:
+		# Not the same scene open - fallback to file apply, will be handled by file sync later
+		print("[GRTC] Live node skipped - scene not open: ", res_path, " current: ", root.filename if root else "null")
+		return
+	var node = root.get_node_or_null(node_path)
+	if node == null:
+		print("[GRTC] Live node not found: ", node_path)
+		return
+	_applying_live = true
+	var parts = state_str.split("|")
+	if node is Spatial and parts.size() >= 3:
+		var t_parts = parts[0].replace("T:", "").split(",")
+		var r_parts = parts[1].replace("R:", "").split(",")
+		var s_parts = parts[2].replace("S:", "").split(",")
+		if t_parts.size() == 3:
+			node.translation = Vector3(float(t_parts[0]), float(t_parts[1]), float(t_parts[2]))
+		if r_parts.size() == 3:
+			node.rotation_degrees = Vector3(float(r_parts[0]), float(r_parts[1]), float(r_parts[2]))
+		if s_parts.size() == 3:
+			node.scale = Vector3(float(s_parts[0]), float(s_parts[1]), float(s_parts[2]))
+		# Update inspector and mark dirty
+		node.property_list_changed_notify()
+		print("[GRTC] Live applied ", node_path, " -> ", state_str)
+		# Update last state to avoid echo
+		_last_live_state[node_path] = state_str
+	_applying_live = false
 
 func _scan_project_snapshot():
 	var snapshot = {}
