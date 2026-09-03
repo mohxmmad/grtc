@@ -19,11 +19,7 @@
 
 ### 🎬 Live Demo
 
-The full two-editor demo lives on the server repo. Watch it there:
-
-**▶️ [RTC demo.mp4 — Two Editors, One Project (rtc-server)](https://github.com/mohxmmad/rtc-server/blob/main/RTC%20demo.mp4)**
-<br/>
-<sub>Raw: <a href="https://raw.githubusercontent.com/mohxmmad/rtc-server/main/RTC%20demo.mp4">https://raw.githubusercontent.com/mohxmmad/rtc-server/main/RTC%20demo.mp4</a> • 3.5 MB</sub>
+https://github.com/user-attachments/assets/39aa1a47-c7b4-43c0-8137-291a3cf76a1c
 
 > Two Godot instances in the same `project:<hash>` room. Moving the **Cube** in `GRTC.tscn` on one instance streams instantly to the other.
 
