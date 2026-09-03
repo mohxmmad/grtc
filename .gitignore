@@ -1,0 +1,36 @@
+# Godot 3.x
+.import/
+.godot/
+export.cfg
+export_presets.cfg
+
+# Godot 4 (future proof)
+.godot/
+
+# Mono / C#
+.mono/
+data_*/
+mono_crash.*.json
+
+# Editor
+*.translation
+*.tmp
+*.log
+
+# GRTC local state (user:// is outside repo, but just in case)
+grtc_panel.cfg
+user://grtc_panel.cfg
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Env / secrets
+.env
