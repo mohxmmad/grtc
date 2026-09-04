@@ -568,9 +568,9 @@ func _handle_remote_event(message):
 	if source_id != "" and source_id == _client_instance_id:
 		return
 	var event_type = str(message.get("event", "file_updated"))
-	# Handle live node transform separately - apply directly to scene in memory
-	if event_type == "live_node":
-		_apply_live_node(data)
+	# Handle live node separately - create/update/delete directly in scene
+	if event_type in ["live_node", "live_node_create", "live_node_delete"]:
+		_apply_live_node(data, event_type)
 		_log_unified("IN", {"type": event_type, "path": str(data.get("path", "")) + ":" + str(data.get("node_path", "")), "data": data})
 		return
 	var change = {
@@ -879,74 +879,128 @@ func _poll_live_scene():
 		scene_path = scene_path.replace("res://", "")
 	var current = {}
 	_collect_live_nodes(root, root, current, scene_path)
-	# Compare
+	# Detect creates and updates
 	for node_path in current.keys():
-		var cur = str(current[node_path])
-		var prev = str(_last_live_state.get(node_path, ""))
-		if prev != cur and prev != "":
-			# Changed - broadcast live
-			_broadcast_live_node(scene_path, node_path, cur)
-	for node_path in current.keys():
-		if not _last_live_state.has(node_path):
-			# New node, init without broadcast
-			pass
+		var cur = current[node_path]
+		var prev = _last_live_state.get(node_path, null)
+		if prev == null:
+			# New object - broadcast creation live
+			_broadcast_live_node(scene_path, node_path, cur["state"], cur["type"], "create")
+		elif str(prev["state"]) != str(cur["state"]) or prev["type"] != cur["type"]:
+			_broadcast_live_node(scene_path, node_path, cur["state"], cur["type"], "update")
+	# Detect deletes
+	for node_path in _last_live_state.keys():
+		if not current.has(node_path):
+			_broadcast_live_node(scene_path, node_path, "", _last_live_state[node_path]["type"], "delete")
 	_last_live_state = current
 
 func _collect_live_nodes(root, node, dict, scene_path):
 	if node != root:
 		var np = str(root.get_path_to(node))
+		var ntype = node.get_class()
+		var state = ""
 		if node is Spatial:
 			var t = node.translation
 			var r = node.rotation_degrees
 			var s = node.scale
-			dict[np] = "T:%.3f,%.3f,%.3f|R:%.3f,%.3f,%.3f|S:%.3f,%.3f,%.3f" % [t.x, t.y, t.z, r.x, r.y, r.z, s.x, s.y, s.z]
+			state = "T:%.3f,%.3f,%.3f|R:%.3f,%.3f,%.3f|S:%.3f,%.3f,%.3f" % [t.x, t.y, t.z, r.x, r.y, r.z, s.x, s.y, s.z]
 		elif node is Control:
 			var p = node.rect_position if "rect_position" in node else Vector2()
-			dict[np] = "P:%.1f,%.1f" % [p.x, p.y]
+			state = "P:%.1f,%.1f" % [p.x, p.y]
+		else:
+			state = str(node.name)
+		dict[np] = {"type": ntype, "state": state}
 	for child in node.get_children():
 		_collect_live_nodes(root, child, dict, scene_path)
 
-func _broadcast_live_node(scene_path, node_path, state_str):
-	var parts = state_str.split("|")
-	var t_str = parts[0] if parts.size() > 0 else ""
-	var r_str = parts[1] if parts.size() > 1 else ""
-	var s_str = parts[2] if parts.size() > 2 else ""
+func _broadcast_live_node(scene_path, node_path, state_str, node_type="Spatial", action="update"):
 	var data = {
 		"path": scene_path,
 		"scene": scene_path,
 		"node_path": node_path,
 		"object": node_path.get_file() if node_path.find("/") == -1 else node_path.split("/")[-1],
 		"state": state_str,
+		"node_type": node_type,
+		"action": action,
 		"source_client_id": _client_instance_id
 	}
-	_log_unified("OUT", {"type": "live_node", "path": scene_path + ":" + node_path, "data": data})
+	var ev = "live_node"
+	if action == "create":
+		ev = "live_node_create"
+	elif action == "delete":
+		ev = "live_node_delete"
+	_log_unified("OUT", {"type": ev, "path": scene_path + ":" + node_path, "data": data})
 	_send_ws_json({
 		"type": "publish",
 		"room": _collaboration_room,
-		"event": "live_node",
+		"event": ev,
 		"data": data
 	})
-	print("[GRTC] Live broadcast ", node_path, " -> ", state_str)
+	print("[GRTC] Live broadcast ", action, " ", node_path, " -> ", state_str, " type:", node_type)
 
-func _apply_live_node(data):
+func _apply_live_node(data, event_type="live_node"):
 	if _editor_interface == null:
 		return
 	var scene_path = str(data.get("path", "GRTC.tscn"))
 	var node_path = str(data.get("node_path", ""))
 	var state_str = str(data.get("state", ""))
-	if node_path == "" or state_str == "":
+	var node_type = str(data.get("node_type", "Spatial"))
+	var action = str(data.get("action", event_type.replace("live_node_", "")))
+	if action == "":
+		action = "update"
+	if node_path == "":
 		return
 	var res_path = "res://" + scene_path
 	var root = _editor_interface.get_edited_scene_root()
 	if root == null or root.filename != res_path:
-		# Not the same scene open - fallback to file apply, will be handled by file sync later
 		print("[GRTC] Live node skipped - scene not open: ", res_path, " current: ", root.filename if root else "null")
 		return
+	_applying_live = true
+	if action == "delete":
+		var node = root.get_node_or_null(node_path)
+		if node:
+			node.get_parent().remove_child(node)
+			node.queue_free()
+			_last_live_state.erase(node_path)
+			print("[GRTC] Live deleted ", node_path)
+		_applying_live = false
+		return
+	if action == "create":
+		var existing = root.get_node_or_null(node_path)
+		if existing:
+			_applying_live = false
+			return
+		var parent_path = node_path.get_base_dir()
+		var parent = root
+		if parent_path != "" and parent_path != "." and parent_path != node_path:
+			parent = root.get_node_or_null(parent_path)
+			if parent == null:
+				parent = root
+		var new_node = null
+		if ClassDB.class_exists(node_type):
+			new_node = ClassDB.instance(node_type)
+		else:
+			new_node = Spatial.new()
+		new_node.name = node_path.get_file()
+		parent.add_child(new_node)
+		new_node.owner = root
+		# Apply initial state if provided
+		if state_str != "":
+			var parts = state_str.split("|")
+			if new_node is Spatial and parts.size() >= 3:
+				var t_parts = parts[0].replace("T:", "").split(",")
+				if t_parts.size() == 3:
+					new_node.translation = Vector3(float(t_parts[0]), float(t_parts[1]), float(t_parts[2]))
+		_last_live_state[node_path] = {"type": node_type, "state": state_str}
+		print("[GRTC] Live created ", node_path, " type:", node_type)
+		_applying_live = false
+		return
+	# update
 	var node = root.get_node_or_null(node_path)
 	if node == null:
 		print("[GRTC] Live node not found: ", node_path)
+		_applying_live = false
 		return
-	_applying_live = true
 	var parts = state_str.split("|")
 	if node is Spatial and parts.size() >= 3:
 		var t_parts = parts[0].replace("T:", "").split(",")
@@ -958,11 +1012,14 @@ func _apply_live_node(data):
 			node.rotation_degrees = Vector3(float(r_parts[0]), float(r_parts[1]), float(r_parts[2]))
 		if s_parts.size() == 3:
 			node.scale = Vector3(float(s_parts[0]), float(s_parts[1]), float(s_parts[2]))
-		# Update inspector and mark dirty
 		node.property_list_changed_notify()
 		print("[GRTC] Live applied ", node_path, " -> ", state_str)
-		# Update last state to avoid echo
-		_last_live_state[node_path] = state_str
+		_last_live_state[node_path] = {"type": node.get_class(), "state": state_str}
+	elif node is Control and state_str.begins_with("P:"):
+		var p_parts = state_str.replace("P:", "").split(",")
+		if p_parts.size() == 2:
+			node.rect_position = Vector2(float(p_parts[0]), float(p_parts[1]))
+			_last_live_state[node_path] = {"type": node_type, "state": state_str}
 	_applying_live = false
 
 func _scan_project_snapshot():
